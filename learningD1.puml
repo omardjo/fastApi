@@ -1,0 +1,53 @@
+@startuml
+skinparam style strictuml
+skinparam sequenceMessageAlign center
+
+actor "Pytest Runner" as Runner
+participant "tests/conftest.py" as ParentConf
+participant "test_post.py\n(Fixtures & Tests)" as TestFile
+participant "create_post()\n(Helper Function)" as Helper
+participant "FastAPI App" as App
+
+== 1. Test Discovery & Fixture Lookup ==
+Runner -> TestFile : Discover test requiring `created_post`
+note right of Runner
+  **Lookup Order:**
+  1. test_post.py (Found!)
+  2. tests/routers/conftest.py
+  3. tests/conftest.py
+end note
+
+Runner -> TestFile : Analyze `created_post` dependencies
+note right of TestFile: `created_post` requires `async_client`.\nPytest searches again and finds\nit in tests/conftest.py.
+
+== 2. Dependency Injection & Setup ==
+Runner -> ParentConf : Resolve `async_client`
+ParentConf --> Runner : Yield injected `async_client`
+
+Runner -> TestFile : Run `created_post` fixture
+note right of Runner: Runner automatically passes\nthe `async_client` to the fixture.
+activate TestFile
+
+== 3. Helper Function Execution ==
+TestFile -> Helper : await create_post("test post", async_client)
+activate Helper
+
+Helper -> App : async_client.post("/post", json=body)
+note right of Helper: Passing `json=body` automatically\nsets Content-Type: application/json
+activate App
+
+App --> Helper : 200 OK (Post created)
+deactivate App
+
+Helper --> TestFile : response.json()
+deactivate Helper
+
+TestFile --> Runner : Return dictionary of the created post
+deactivate TestFile
+
+== 4. Test Execution ==
+Runner -> TestFile : Run actual Test Function
+note right of Runner: The test function now starts with\nthe `created_post` data ready to go!
+TestFile -> TestFile : Perform test assertions
+
+@enduml
