@@ -4,7 +4,6 @@ import os
 
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 
@@ -26,6 +25,9 @@ class Settings:
     login_rate_limit_window_seconds: int = 60
     refresh_rate_limit_max: int = 30
     refresh_rate_limit_window_seconds: int = 60
+    upload_dir: str = "uploads/images"
+    upload_url_prefix: str = "/uploads/images"
+    max_image_upload_bytes: int = 5 * 1024 * 1024
 
 
 @lru_cache()
@@ -78,6 +80,16 @@ def get_config() -> Settings:
         os.getenv(f"{env_prefix}REFRESH_RATE_LIMIT_WINDOW_SECONDS")
         or os.getenv("REFRESH_RATE_LIMIT_WINDOW_SECONDS", "60")
     )
+    upload_dir = os.getenv(f"{env_prefix}UPLOAD_DIR") or os.getenv(
+        "UPLOAD_DIR", "uploads/images"
+    )
+    upload_url_prefix = os.getenv(f"{env_prefix}UPLOAD_URL_PREFIX") or os.getenv(
+        "UPLOAD_URL_PREFIX", "/uploads/images"
+    )
+    max_image_upload_bytes = int(
+        os.getenv(f"{env_prefix}MAX_IMAGE_UPLOAD_BYTES")
+        or os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(5 * 1024 * 1024))
+    )
 
     if env_state == "test":
         db_force_rollback = True
@@ -94,6 +106,9 @@ def get_config() -> Settings:
         login_rate_limit_window_seconds=login_rate_limit_window_seconds,
         refresh_rate_limit_max=refresh_rate_limit_max,
         refresh_rate_limit_window_seconds=refresh_rate_limit_window_seconds,
+        upload_dir=upload_dir,
+        upload_url_prefix=upload_url_prefix,
+        max_image_upload_bytes=max_image_upload_bytes,
     )
 
 

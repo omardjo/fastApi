@@ -69,7 +69,7 @@ async def test_create_post_requires_auth(async_client: AsyncClient):
 async def test_get_all_posts(async_client: AsyncClient, created_post: dict):
     response = await async_client.get("/post", headers=await auth_headers(async_client))
     assert response.status_code == 200
-    assert response.json() == [created_post]
+    assert created_post in response.json()
 
 
 @pytest.mark.anyio

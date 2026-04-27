@@ -13,10 +13,13 @@ from httpx import (
 os.environ["ENV_STATE"] = (
     "test"  # we set this environment variable to test so that when we import the config it will use the TestConfig class and populate the environment variables from there. This is important because we want to make sure that when we run our tests we're using the test database and not the development or production database.
 )
-from blogapi.database import database  # noqa: E402
+from blogapi.database import database, engine, init_models  # noqa: E402
 
 from blogapi.main import app  # noqa: E402
+
 # IMPORTS Must be at the top of the file.so adding this comment to ignore that rule.
+
+_schema_initialized = False
 
 
 @pytest.fixture(scope="session")
@@ -33,6 +36,11 @@ def client() -> Generator:
 
 @pytest.fixture(autouse=True)  # ensure it runs in every test
 async def db() -> AsyncGenerator:
+    global _schema_initialized
+    if not _schema_initialized:
+        await init_models()
+        await engine.dispose()
+        _schema_initialized = True
     await database.connect()
     yield
     await database.disconnect()

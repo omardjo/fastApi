@@ -3,3 +3,4 @@ uvicorn[standard]
 sqlalchemy
 databases[asyncpg]
 python-dotenv
+python-multipart

@@ -1,6 +1,7 @@
 import asyncio
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
+import secrets
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -9,12 +10,17 @@ import sqlalchemy
 from blogapi.config import config
 from blogapi.database import (
     auth_security_event_table,
+    comment_table,
     database,
+    post_table,
     refresh_token_table,
+    saved_post_table,
     user_table,
 )
 from blogapi.models.auth import (
     AuthResponse,
+    CurrentUserProfile,
+    CurrentUserUpdate,
     LogoutRequest,
     RefreshTokenRequest,
     UserCreate,
@@ -29,7 +35,6 @@ from blogapi.security import (
     hash_refresh_token,
     verify_password,
 )
-
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 _auth_schema_ready = False
@@ -53,12 +58,33 @@ async def _ensure_auth_schema() -> None:
     )
     await database.execute(
         sqlalchemy.text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(150)"
+        )
+    )
+    await database.execute(
+        sqlalchemy.text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
         )
     )
     await database.execute(
         sqlalchemy.text(
-            """
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'user'"
+        )
+    )
+    await database.execute(
+        sqlalchemy.text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(150)"
+        )
+    )
+    await database.execute(
+        sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT")
+    )
+    await database.execute(
+        sqlalchemy.text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(1024)"
+        )
+    )
+    await database.execute(sqlalchemy.text("""
             DO $$
             BEGIN
                 IF EXISTS (
@@ -72,37 +98,54 @@ async def _ensure_auth_schema() -> None:
                 END IF;
             END
             $$;
-            """
-        )
+            """))
+    await database.execute(
+        sqlalchemy.text("ALTER TABLE users ALTER COLUMN email SET NOT NULL")
+    )
+    await database.execute(
+        sqlalchemy.text("UPDATE users SET created_at = NOW() WHERE created_at IS NULL")
+    )
+    await database.execute(
+        sqlalchemy.text("ALTER TABLE users ALTER COLUMN created_at SET NOT NULL")
+    )
+    await database.execute(
+        sqlalchemy.text("UPDATE users SET role = 'user' WHERE role IS NULL")
+    )
+    await database.execute(
+        sqlalchemy.text("ALTER TABLE users ALTER COLUMN role SET NOT NULL")
     )
     await database.execute(
         sqlalchemy.text(
-            """
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_name = 'users' AND column_name = 'username' AND is_nullable = 'NO'
-                ) THEN
-                    ALTER TABLE users ALTER COLUMN username DROP NOT NULL;
-                END IF;
-            END
-            $$;
-            """
+            "UPDATE users SET username = regexp_replace(split_part(email, '@', 1), '[^a-zA-Z0-9_]+', '_', 'g') || '_' || id WHERE username IS NULL"
         )
     )
     await database.execute(
-        sqlalchemy.text("ALTER TABLE users ALTER COLUMN email SET NOT NULL")
+        sqlalchemy.text("ALTER TABLE users ALTER COLUMN username SET NOT NULL")
+    )
+    await database.execute(
+        sqlalchemy.text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users (username)"
+        )
     )
     await database.execute(
         sqlalchemy.text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)"
         )
     )
+    await database.execute(sqlalchemy.text("""
+            CREATE TABLE IF NOT EXISTS saved_posts (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, post_id)
+            )
+            """))
     await database.execute(
         sqlalchemy.text(
-            """
+            "CREATE INDEX IF NOT EXISTS ix_saved_posts_post_id ON saved_posts (post_id)"
+        )
+    )
+    await database.execute(sqlalchemy.text("""
             CREATE TABLE IF NOT EXISTS refresh_tokens (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -115,9 +158,7 @@ async def _ensure_auth_schema() -> None:
                 user_agent VARCHAR(512) NULL,
                 device_id VARCHAR(128) NULL
             )
-            """
-        )
-    )
+            """))
     await database.execute(
         sqlalchemy.text(
             "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS ip_address VARCHAR(64)"
@@ -138,9 +179,7 @@ async def _ensure_auth_schema() -> None:
             "CREATE INDEX IF NOT EXISTS ix_refresh_tokens_user_id ON refresh_tokens (user_id)"
         )
     )
-    await database.execute(
-        sqlalchemy.text(
-            """
+    await database.execute(sqlalchemy.text("""
             CREATE TABLE IF NOT EXISTS auth_security_events (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
@@ -152,9 +191,7 @@ async def _ensure_auth_schema() -> None:
                 details JSONB NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-            """
-        )
-    )
+            """))
     await database.execute(
         sqlalchemy.text(
             "CREATE INDEX IF NOT EXISTS ix_auth_security_events_user_id ON auth_security_events (user_id)"
@@ -169,13 +206,69 @@ async def _ensure_auth_schema() -> None:
     _auth_schema_ready = True
 
 
-def _auth_response(user_id: int, email: str, access_token: str, refresh_token: str):
+async def _auth_response(user_id: int, access_token: str, refresh_token: str):
+    user = await database.fetch_one(
+        user_table.select().where(user_table.c.id == user_id)
+    )
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "expires_in": access_token_expires_in_seconds(),
-        "user": {"id": user_id, "email": email},
+        "user": dict(user),
     }
+
+
+async def _current_user_profile(user_id: int) -> dict:
+    user = await database.fetch_one(
+        user_table.select().where(user_table.c.id == user_id)
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found"
+        )
+
+    posts_count = await database.fetch_val(
+        sqlalchemy.select(sqlalchemy.func.count())
+        .select_from(post_table)
+        .where(post_table.c.author_id == user_id)
+    )
+    comments_count = await database.fetch_val(
+        sqlalchemy.select(sqlalchemy.func.count())
+        .select_from(comment_table)
+        .where(comment_table.c.author_id == user_id)
+    )
+    saved_posts_count = await database.fetch_val(
+        sqlalchemy.select(sqlalchemy.func.count())
+        .select_from(saved_post_table)
+        .where(saved_post_table.c.user_id == user_id)
+    )
+    data = dict(user)
+    data.update(
+        {
+            "posts_count": posts_count or 0,
+            "comments_count": comments_count or 0,
+            "saved_posts_count": saved_posts_count or 0,
+            "followers_count": 0,
+            "following_count": 0,
+        }
+    )
+    return data
+
+
+def _username_base(email: str) -> str:
+    local_part = email.split("@", 1)[0]
+    username = "".join(ch if ch.isalnum() else "_" for ch in local_part).strip("_")
+    return (username or "user")[:120]
+
+
+async def _unique_username(email: str) -> str:
+    base = _username_base(email)
+    username = base
+    while await database.fetch_one(
+        user_table.select().where(user_table.c.username == username)
+    ):
+        username = f"{base}_{secrets.token_hex(4)}"
+    return username
 
 
 def _extract_session_metadata(request: Request) -> dict:
@@ -244,20 +337,6 @@ async def _write_security_event(
     )
 
 
-async def _is_legacy_username_required() -> bool:
-    row = await database.fetch_one(
-        sqlalchemy.text(
-            """
-            SELECT is_nullable
-            FROM information_schema.columns
-            WHERE table_name = 'users' AND column_name = 'username'
-            LIMIT 1
-            """
-        )
-    )
-    return row is not None and row["is_nullable"] == "NO"
-
-
 async def _persist_refresh_token(
     user_id: int,
     refresh_token: str,
@@ -302,7 +381,7 @@ async def _issue_token_pair(
         session_meta=session_meta,
         replaced_token_id=replaced_token_id,
     )
-    return _auth_response(user_id, email, access_token, refresh_token)
+    return await _auth_response(user_id, access_token, refresh_token)
 
 
 async def _revoke_active_refresh_tokens_for_user(user_id: int) -> None:
@@ -327,12 +406,21 @@ async def register(user: UserCreate, request: Request):
             status_code=status.HTTP_409_CONFLICT, detail="Email already exists"
         )
 
+    username = user.username or await _unique_username(user.email)
+    username_exists = await database.fetch_one(
+        user_table.select().where(user_table.c.username == username)
+    )
+    if username_exists is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already exists",
+        )
+
     data = {
         "email": user.email,
         "password_hash": hash_password(user.password),
+        "username": username,
     }
-    if await _is_legacy_username_required():
-        data["username"] = user.email
     user_id = await database.execute(user_table.insert().values(data))
     return await _issue_token_pair(
         user_id=user_id,
@@ -469,3 +557,37 @@ async def logout_all(current_user: CurrentUser) -> Response:
     await _ensure_auth_schema()
     await _revoke_active_refresh_tokens_for_user(current_user["id"])
     return Response(status_code=204)
+
+
+@router.get("/me", response_model=CurrentUserProfile)
+async def get_me(current_user: CurrentUser):
+    await _ensure_auth_schema()
+    return await _current_user_profile(current_user["id"])
+
+
+@router.put("/me", response_model=CurrentUserProfile)
+async def update_me(payload: CurrentUserUpdate, current_user: CurrentUser):
+    await _ensure_auth_schema()
+    values = payload.model_dump(exclude_unset=True)
+    if not values:
+        return await _current_user_profile(current_user["id"])
+
+    if "username" in values:
+        existing = await database.fetch_one(
+            user_table.select().where(
+                (user_table.c.username == values["username"])
+                & (user_table.c.id != current_user["id"])
+            )
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already exists",
+            )
+
+    await database.execute(
+        user_table.update()
+        .where(user_table.c.id == current_user["id"])
+        .values(**values)
+    )
+    return await _current_user_profile(current_user["id"])
