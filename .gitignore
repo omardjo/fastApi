@@ -7,5 +7,12 @@ __pycache__
 .vscode/
 *.png
 .venv/
-.env.example
 migrations/
+secrets/
+*firebase-adminsdk*.json
+firebase-service-account*.json
+*.service-account.json
+secrets/
+*firebase-adminsdk*.json
+firebase-service-account*.json
+*.service-account.json

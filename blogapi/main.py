@@ -9,8 +9,10 @@ from blogapi.database import database, init_models
 from blogapi.routers.auth import router as auth_router
 from blogapi.routers.health import router as health_router
 from blogapi.routers.me import router as me_router
+from blogapi.routers.notifications import router as notifications_router
 from blogapi.routers.post import router as post_router
 from blogapi.routers.uploads import router as uploads_router
+from blogapi.routers.users import router as users_router
 
 
 @asynccontextmanager
@@ -37,6 +39,8 @@ async def add_security_headers(request: Request, call_next):
 app.include_router(auth_router)
 app.include_router(post_router)
 app.include_router(me_router)
+app.include_router(users_router)
+app.include_router(notifications_router)
 app.include_router(uploads_router)
 app.include_router(health_router)
 

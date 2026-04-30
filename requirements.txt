@@ -4,3 +4,4 @@ sqlalchemy
 databases[asyncpg]
 python-dotenv
 python-multipart
+firebase-admin

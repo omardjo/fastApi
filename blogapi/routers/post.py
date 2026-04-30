@@ -10,9 +10,11 @@ from blogapi.database import (
     database,
     post_table,
     post_tag_table,
+    reading_record_table,
     tag_table,
     user_table,
 )
+from blogapi.models.me import ReadingRecordIn, ReadingRecordOut
 from blogapi.models.post import (
     CategoryCreate,
     CategoryOut,
@@ -31,6 +33,7 @@ from blogapi.models.post import (
     UserPostWithComments,
 )
 from blogapi.security import get_current_user
+from blogapi.services.firebase_notifications import notify_followers_about_new_post
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -397,6 +400,10 @@ async def create_post_v2(payload: PostCreate, current_user=Depends(get_current_u
     await _replace_post_tags(post_id, tag_ids)
 
     created = await find_post(post_id)
+    if payload.status == "published":
+        await notify_followers_about_new_post(
+            author_id=current_user["id"], post_id=post_id, post_title=payload.title
+        )
     return await _post_detail(created)
 
 
@@ -458,6 +465,53 @@ async def get_post(post_id: int):
     return await _post_detail(post)
 
 
+@router.post("/posts/{post_id}/reading-progress", response_model=ReadingRecordOut)
+async def upsert_post_reading_progress(
+    post_id: int, payload: ReadingRecordIn, current_user=Depends(get_current_user)
+):
+    post = await find_post(post_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    now = datetime.now(UTC)
+    reading_minutes = payload.reading_minutes
+    if reading_minutes is None:
+        reading_minutes = _reading_minutes(post["content"] or post["body"])
+    completed_at = now if payload.progress_percent >= 100 else None
+    existing = await database.fetch_one(
+        reading_record_table.select().where(
+            (reading_record_table.c.user_id == current_user["id"])
+            & (reading_record_table.c.post_id == post_id)
+        )
+    )
+    values = {
+        "progress_percent": payload.progress_percent,
+        "reading_minutes": reading_minutes,
+        "completed_at": completed_at,
+        "updated_at": now,
+    }
+    if existing is None:
+        record_id = await database.execute(
+            reading_record_table.insert().values(
+                user_id=current_user["id"], post_id=post_id, **values
+            )
+        )
+    else:
+        record_id = existing["id"]
+        if completed_at is None:
+            values["completed_at"] = existing["completed_at"]
+        await database.execute(
+            reading_record_table.update()
+            .where(reading_record_table.c.id == record_id)
+            .values(**values)
+        )
+
+    row = await database.fetch_one(
+        reading_record_table.select().where(reading_record_table.c.id == record_id)
+    )
+    return dict(row)
+
+
 @router.put("/posts/{post_id}", response_model=PostDetailOut)
 async def update_post(
     post_id: int, payload: PostUpdate, current_user=Depends(get_current_user)
@@ -496,6 +550,16 @@ async def update_post(
         await _replace_post_tags(post_id, tag_ids)
 
     updated = await find_post(post_id)
+    if (
+        payload.status == "published"
+        and post["status"] != "published"
+        and updated is not None
+    ):
+        await notify_followers_about_new_post(
+            author_id=current_user["id"],
+            post_id=post_id,
+            post_title=updated["title"],
+        )
     return await _post_detail(updated)
 
 

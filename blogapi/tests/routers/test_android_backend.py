@@ -1,9 +1,11 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from httpx import AsyncClient
 import pytest
 
 from blogapi.config import config
+from blogapi.database import database, reading_record_table
 
 IMAGE_FIXTURES = {
     "image/jpeg": b"\xff\xd8\xff\xe0jpeg",
@@ -351,11 +353,341 @@ async def test_android_profile_posts_saved_activity_and_settings(
     settings = await async_client.put(
         "/me/settings",
         headers=headers,
-        json={"notifications_enabled": False, "appearance": "dark", "language": "ar"},
+        json={"notifications_enabled": False, "appearance": "dark", "language": "fr"},
     )
     assert settings.status_code == 200
     assert settings.json()["notifications_enabled"] is False
     assert settings.json()["appearance"] == "dark"
+    assert settings.json()["language"] == "fr"
+
+
+@pytest.mark.anyio
+async def test_me_settings_post_persists_partial_updates_and_is_per_user(
+    async_client: AsyncClient,
+):
+    first_user = await register_user(async_client)
+    first_headers = first_user["headers"]
+    second_user = await register_user(async_client)
+    second_headers = second_user["headers"]
+
+    defaults = await async_client.get("/me/settings", headers=first_headers)
+    assert defaults.status_code == 200
+    assert defaults.json()["notifications_enabled"] is True
+    assert defaults.json()["appearance"] == "system"
+    assert defaults.json()["language"] == "en"
+
+    updated = await async_client.post(
+        "/me/settings",
+        headers=first_headers,
+        json={
+            "notifications_enabled": False,
+            "appearance": "dark",
+            "language": "fr",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["notifications_enabled"] is False
+    assert updated.json()["appearance"] == "dark"
+    assert updated.json()["language"] == "fr"
+    assert updated.json()["updated_at"] is not None
+
+    partial = await async_client.post(
+        "/me/settings",
+        headers=first_headers,
+        json={"appearance": "light"},
+    )
+    assert partial.status_code == 200
+    assert partial.json()["notifications_enabled"] is False
+    assert partial.json()["appearance"] == "light"
+    assert partial.json()["language"] == "fr"
+
+    persisted = await async_client.get("/me/settings", headers=first_headers)
+    assert persisted.status_code == 200
+    assert persisted.json()["notifications_enabled"] is False
+    assert persisted.json()["appearance"] == "light"
+    assert persisted.json()["language"] == "fr"
+
+    other_user_settings = await async_client.get("/me/settings", headers=second_headers)
+    assert other_user_settings.status_code == 200
+    assert other_user_settings.json()["notifications_enabled"] is True
+    assert other_user_settings.json()["appearance"] == "system"
+    assert other_user_settings.json()["language"] == "en"
+
+
+@pytest.mark.anyio
+async def test_me_settings_rejects_invalid_appearance_and_language(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    headers = user["headers"]
+
+    invalid_appearance = await async_client.post(
+        "/me/settings",
+        headers=headers,
+        json={"appearance": "midnight"},
+    )
+    assert invalid_appearance.status_code == 422
+
+    invalid_language = await async_client.post(
+        "/me/settings",
+        headers=headers,
+        json={"language": "ar"},
+    )
+    assert invalid_language.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_android_reading_journey_groups_progress_by_category(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    headers = user["headers"]
+
+    category = await async_client.post(
+        "/categories",
+        headers=headers,
+        json={
+            "name": f"Journey {uuid4().hex[:8]}",
+            "slug": f"journey-{uuid4().hex[:8]}",
+        },
+    )
+    assert category.status_code == 201
+    category_id = category.json()["id"]
+
+    first = await async_client.post(
+        "/posts",
+        headers=headers,
+        json={
+            "title": "Journey Complete",
+            "content": " ".join(["complete"] * 260),
+            "category_id": category_id,
+            "status": "published",
+        },
+    )
+    assert first.status_code == 201
+    second = await async_client.post(
+        "/posts",
+        headers=headers,
+        json={
+            "title": "Journey Started",
+            "content": " ".join(["started"] * 80),
+            "category_id": category_id,
+            "status": "published",
+        },
+    )
+    assert second.status_code == 201
+
+    first_id = first.json()["id"]
+    second_id = second.json()["id"]
+    completed = await async_client.post(
+        f"/posts/{first_id}/reading-progress",
+        headers=headers,
+        json={"progress_percent": 100},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["progress_percent"] == 100
+    assert completed.json()["completed_at"] is not None
+
+    partial = await async_client.post(
+        f"/me/reading-records/{second_id}",
+        headers=headers,
+        json={"progress_percent": 50, "reading_minutes": 7},
+    )
+    assert partial.status_code == 200
+
+    saved = await async_client.post(f"/me/saved-posts/{second_id}", headers=headers)
+    assert saved.status_code == 201
+
+    response = await async_client.get("/me/reading-journey", headers=headers)
+    assert response.status_code == 200
+    journey_category = next(
+        item
+        for item in response.json()["categories"]
+        if item["category_id"] == category_id
+    )
+    assert journey_category["category_name"] == category.json()["name"]
+    assert journey_category["total_posts"] == 2
+    assert journey_category["started_posts"] == 2
+    assert journey_category["completed_posts"] == 1
+    assert journey_category["saved_posts"] == 1
+    assert journey_category["progress_percent"] == 75
+    assert (
+        journey_category["reading_minutes"] == completed.json()["reading_minutes"] + 7
+    )
+    assert journey_category["last_read_at"] is not None
+    assert "months" in response.json()
+
+
+@pytest.mark.anyio
+async def test_android_reading_journey_groups_progress_by_month(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    headers = user["headers"]
+
+    category = await async_client.post(
+        "/categories",
+        headers=headers,
+        json={
+            "name": f"Monthly Journey {uuid4().hex[:8]}",
+            "slug": f"monthly-journey-{uuid4().hex[:8]}",
+        },
+    )
+    assert category.status_code == 201
+    category_id = category.json()["id"]
+
+    first = await async_client.post(
+        "/posts",
+        headers=headers,
+        json={
+            "title": "Monthly Complete",
+            "content": " ".join(["complete"] * 260),
+            "category_id": category_id,
+            "status": "published",
+        },
+    )
+    second = await async_client.post(
+        "/posts",
+        headers=headers,
+        json={
+            "title": "Monthly Started",
+            "content": " ".join(["started"] * 80),
+            "category_id": category_id,
+            "status": "published",
+        },
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+    first_id = first.json()["id"]
+    second_id = second.json()["id"]
+
+    completed = await async_client.post(
+        f"/posts/{first_id}/reading-progress",
+        headers=headers,
+        json={"progress_percent": 100, "reading_minutes": 5},
+    )
+    partial = await async_client.post(
+        f"/posts/{second_id}/reading-progress",
+        headers=headers,
+        json={"progress_percent": 50, "reading_minutes": 7},
+    )
+    assert completed.status_code == 200
+    assert partial.status_code == 200
+
+    april_completed_at = datetime(2026, 4, 29, 19, 36, 38, tzinfo=UTC)
+    april_updated_at = datetime(2026, 4, 29, 19, 30, 0, tzinfo=UTC)
+    await database.execute(
+        reading_record_table.update()
+        .where(reading_record_table.c.post_id == first_id)
+        .values(completed_at=april_completed_at, updated_at=april_updated_at)
+    )
+    await database.execute(
+        reading_record_table.update()
+        .where(reading_record_table.c.post_id == second_id)
+        .values(
+            completed_at=None,
+            updated_at=datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    response = await async_client.get("/me/reading-journey", headers=headers)
+    assert response.status_code == 200
+    months = response.json()["months"]
+    april = next(item for item in months if item["year"] == 2026 and item["month"] == 4)
+
+    assert april["month_label"] == "April 2026"
+    assert april["started_posts"] == 2
+    assert april["completed_posts"] == 1
+    assert april["reading_minutes"] == 12
+    assert april["progress_percent"] == 75
+    assert april["last_read_at"].startswith("2026-04-29T19:36:38")
+    month_category = next(
+        item for item in april["categories"] if item["category_id"] == category_id
+    )
+    assert month_category["total_posts"] == 2
+    assert month_category["started_posts"] == 2
+    assert month_category["completed_posts"] == 1
+    assert month_category["progress_percent"] == 75
+    assert month_category["reading_minutes"] == 12
+
+
+@pytest.mark.anyio
+async def test_android_reading_journey_months_sort_newest_first(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    headers = user["headers"]
+
+    category = await async_client.post(
+        "/categories",
+        headers=headers,
+        json={
+            "name": f"Sorted Journey {uuid4().hex[:8]}",
+            "slug": f"sorted-journey-{uuid4().hex[:8]}",
+        },
+    )
+    assert category.status_code == 201
+    category_id = category.json()["id"]
+
+    post_ids = []
+    for title in ["March Read", "April Read"]:
+        created = await async_client.post(
+            "/posts",
+            headers=headers,
+            json={
+                "title": title,
+                "content": "Timeline content.",
+                "category_id": category_id,
+                "status": "published",
+            },
+        )
+        assert created.status_code == 201
+        post_ids.append(created.json()["id"])
+        progress = await async_client.post(
+            f"/posts/{created.json()['id']}/reading-progress",
+            headers=headers,
+            json={"progress_percent": 100, "reading_minutes": 1},
+        )
+        assert progress.status_code == 200
+
+    await database.execute(
+        reading_record_table.update()
+        .where(reading_record_table.c.post_id == post_ids[0])
+        .values(
+            completed_at=datetime(2026, 3, 10, 10, 0, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 3, 10, 10, 0, 0, tzinfo=UTC),
+        )
+    )
+    await database.execute(
+        reading_record_table.update()
+        .where(reading_record_table.c.post_id == post_ids[1])
+        .values(
+            completed_at=datetime(2026, 4, 10, 10, 0, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 4, 10, 10, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    response = await async_client.get("/me/reading-journey", headers=headers)
+    assert response.status_code == 200
+    relevant_months = [
+        (item["year"], item["month"])
+        for item in response.json()["months"]
+        if any(category["category_id"] == category_id for category in item["categories"])
+    ]
+    assert relevant_months == [(2026, 4), (2026, 3)]
+
+
+@pytest.mark.anyio
+async def test_android_empty_reading_journey_includes_empty_months(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+
+    response = await async_client.get("/me/reading-journey", headers=user["headers"])
+    assert response.status_code == 200
+    data = response.json()
+    assert "categories" in data
+    assert data["months"] == []
 
 
 @pytest.mark.anyio
@@ -364,4 +696,10 @@ async def test_me_endpoints_require_auth(async_client: AsyncClient):
     assert response.status_code == 401
 
     response = await async_client.get("/me/saved-posts")
+    assert response.status_code == 401
+
+    response = await async_client.get("/me/reading-journey")
+    assert response.status_code == 401
+
+    response = await async_client.post("/me/settings", json={"appearance": "dark"})
     assert response.status_code == 401

@@ -135,6 +135,66 @@ saved_post_table = sqlalchemy.Table(
     ),
 )
 
+user_follow_table = sqlalchemy.Table(
+    "user_follows",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column(
+        "follower_id",
+        sqlalchemy.ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sqlalchemy.Column(
+        "following_id",
+        sqlalchemy.ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sqlalchemy.Column(
+        "created_at",
+        sqlalchemy.DateTime(timezone=True),
+        nullable=False,
+        server_default=sqlalchemy.func.now(),
+    ),
+    sqlalchemy.UniqueConstraint(
+        "follower_id", "following_id", name="uq_user_follows_follower_following"
+    ),
+    sqlalchemy.CheckConstraint(
+        "follower_id <> following_id", name="ck_user_follows_not_self"
+    ),
+)
+
+user_device_token_table = sqlalchemy.Table(
+    "user_device_tokens",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column(
+        "user_id",
+        sqlalchemy.ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sqlalchemy.Column("fcm_token", sqlalchemy.String(4096), nullable=False),
+    sqlalchemy.Column(
+        "platform", sqlalchemy.String(32), nullable=False, server_default="android"
+    ),
+    sqlalchemy.Column("device_name", sqlalchemy.String(255), nullable=True),
+    sqlalchemy.Column(
+        "is_active", sqlalchemy.Boolean, nullable=False, server_default="true"
+    ),
+    sqlalchemy.Column(
+        "created_at",
+        sqlalchemy.DateTime(timezone=True),
+        nullable=False,
+        server_default=sqlalchemy.func.now(),
+    ),
+    sqlalchemy.Column(
+        "updated_at",
+        sqlalchemy.DateTime(timezone=True),
+        nullable=False,
+        server_default=sqlalchemy.func.now(),
+    ),
+    sqlalchemy.UniqueConstraint("fcm_token", name="uq_user_device_tokens_fcm_token"),
+)
+
 reading_record_table = sqlalchemy.Table(
     "reading_records",
     metadata,
@@ -159,6 +219,9 @@ reading_record_table = sqlalchemy.Table(
         sqlalchemy.DateTime(timezone=True),
         nullable=False,
         server_default=sqlalchemy.func.now(),
+    ),
+    sqlalchemy.UniqueConstraint(
+        "user_id", "post_id", name="uq_reading_records_user_post"
     ),
 )
 
@@ -439,6 +502,29 @@ async def init_models() -> None:
                 )
                 """))
         await conn.execute(sqlalchemy.text("""
+                CREATE TABLE IF NOT EXISTS user_follows (
+                    id SERIAL PRIMARY KEY,
+                    follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    following_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_user_follows_follower_following UNIQUE (follower_id, following_id),
+                    CONSTRAINT ck_user_follows_not_self CHECK (follower_id <> following_id)
+                )
+                """))
+        await conn.execute(sqlalchemy.text("""
+                CREATE TABLE IF NOT EXISTS user_device_tokens (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    fcm_token VARCHAR(4096) NOT NULL,
+                    platform VARCHAR(32) NOT NULL DEFAULT 'android',
+                    device_name VARCHAR(255) NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_user_device_tokens_fcm_token UNIQUE (fcm_token)
+                )
+                """))
+        await conn.execute(sqlalchemy.text("""
                 CREATE TABLE IF NOT EXISTS reading_records (
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -652,6 +738,26 @@ async def init_models() -> None:
         await conn.execute(
             sqlalchemy.text(
                 "CREATE INDEX IF NOT EXISTS ix_saved_posts_post_id ON saved_posts (post_id)"
+            )
+        )
+        await conn.execute(
+            sqlalchemy.text(
+                "CREATE INDEX IF NOT EXISTS ix_user_follows_follower_id ON user_follows (follower_id)"
+            )
+        )
+        await conn.execute(
+            sqlalchemy.text(
+                "CREATE INDEX IF NOT EXISTS ix_user_follows_following_id ON user_follows (following_id)"
+            )
+        )
+        await conn.execute(
+            sqlalchemy.text(
+                "CREATE INDEX IF NOT EXISTS ix_user_device_tokens_user_id ON user_device_tokens (user_id)"
+            )
+        )
+        await conn.execute(
+            sqlalchemy.text(
+                "CREATE INDEX IF NOT EXISTS ix_user_device_tokens_active_user ON user_device_tokens (user_id, is_active)"
             )
         )
         await conn.execute(

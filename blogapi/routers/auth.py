@@ -15,6 +15,7 @@ from blogapi.database import (
     post_table,
     refresh_token_table,
     saved_post_table,
+    user_follow_table,
     user_table,
 )
 from blogapi.models.auth import (
@@ -242,14 +243,24 @@ async def _current_user_profile(user_id: int) -> dict:
         .select_from(saved_post_table)
         .where(saved_post_table.c.user_id == user_id)
     )
+    followers_count = await database.fetch_val(
+        sqlalchemy.select(sqlalchemy.func.count())
+        .select_from(user_follow_table)
+        .where(user_follow_table.c.following_id == user_id)
+    )
+    following_count = await database.fetch_val(
+        sqlalchemy.select(sqlalchemy.func.count())
+        .select_from(user_follow_table)
+        .where(user_follow_table.c.follower_id == user_id)
+    )
     data = dict(user)
     data.update(
         {
             "posts_count": posts_count or 0,
             "comments_count": comments_count or 0,
             "saved_posts_count": saved_posts_count or 0,
-            "followers_count": 0,
-            "following_count": 0,
+            "followers_count": followers_count or 0,
+            "following_count": following_count or 0,
         }
     )
     return data

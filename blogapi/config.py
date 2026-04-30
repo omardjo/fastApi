@@ -28,6 +28,7 @@ class Settings:
     upload_dir: str = "uploads/images"
     upload_url_prefix: str = "/uploads/images"
     max_image_upload_bytes: int = 5 * 1024 * 1024
+    firebase_service_account_path: str | None = None
 
 
 @lru_cache()
@@ -90,6 +91,9 @@ def get_config() -> Settings:
         os.getenv(f"{env_prefix}MAX_IMAGE_UPLOAD_BYTES")
         or os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(5 * 1024 * 1024))
     )
+    firebase_service_account_path = os.getenv(
+        f"{env_prefix}FIREBASE_SERVICE_ACCOUNT_PATH"
+    ) or os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
 
     if env_state == "test":
         db_force_rollback = True
@@ -109,6 +113,7 @@ def get_config() -> Settings:
         upload_dir=upload_dir,
         upload_url_prefix=upload_url_prefix,
         max_image_upload_bytes=max_image_upload_bytes,
+        firebase_service_account_path=firebase_service_account_path,
     )
 
 
