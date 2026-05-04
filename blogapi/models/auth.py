@@ -58,6 +58,12 @@ class CurrentUserProfile(BaseModel):
     avatar_url: str | None = None
     created_at: datetime
     posts_count: int = 0
+    published_posts_count: int = 0
+    draft_posts_count: int = 0
+    archived_posts_count: int = 0
+    published_posts: int = 0
+    draft_posts: int = 0
+    archived_posts: int = 0
     comments_count: int = 0
     saved_posts_count: int = 0
     followers_count: int = 0

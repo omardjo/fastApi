@@ -722,6 +722,11 @@ async def init_models() -> None:
         )
         await conn.execute(
             sqlalchemy.text(
+                "CREATE INDEX IF NOT EXISTS ix_posts_author_status ON posts (author_id, status)"
+            )
+        )
+        await conn.execute(
+            sqlalchemy.text(
                 "CREATE INDEX IF NOT EXISTS ix_comments_post_id ON comments (post_id)"
             )
         )
@@ -768,6 +773,11 @@ async def init_models() -> None:
         await conn.execute(
             sqlalchemy.text(
                 "CREATE INDEX IF NOT EXISTS ix_reading_records_post_id ON reading_records (post_id)"
+            )
+        )
+        await conn.execute(
+            sqlalchemy.text(
+                "CREATE INDEX IF NOT EXISTS ix_reading_records_user_progress ON reading_records (user_id, progress_percent)"
             )
         )
         await conn.execute(

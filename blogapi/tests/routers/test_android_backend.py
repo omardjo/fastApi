@@ -1,11 +1,16 @@
-from datetime import UTC, datetime
+import base64
+from datetime import UTC, datetime, timedelta
+import hashlib
+import hmac
+import json
 from uuid import uuid4
 
 from httpx import AsyncClient
 import pytest
+from sqlalchemy import func, select
 
 from blogapi.config import config
-from blogapi.database import database, reading_record_table
+from blogapi.database import category_table, database, post_table, reading_record_table
 
 IMAGE_FIXTURES = {
     "image/jpeg": b"\xff\xd8\xff\xe0jpeg",
@@ -50,6 +55,22 @@ async def upload_image(
     assert data["content_type"] == content_type
     assert data["size"] == len(IMAGE_FIXTURES[content_type])
     return data
+
+
+def expired_access_token(user_id: int, email: str) -> str:
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "typ": "access",
+        "exp": int((datetime.now(UTC) - timedelta(minutes=1)).timestamp()),
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode()
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode()
+    signature = hmac.new(
+        config.auth_secret.encode(), payload_b64.encode(), hashlib.sha256
+    ).digest()
+    signature_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return f"{payload_b64}.{signature_b64}"
 
 
 @pytest.mark.anyio
@@ -359,6 +380,375 @@ async def test_android_profile_posts_saved_activity_and_settings(
     assert settings.json()["notifications_enabled"] is False
     assert settings.json()["appearance"] == "dark"
     assert settings.json()["language"] == "fr"
+
+
+@pytest.mark.anyio
+async def test_android_activity_summary_returns_real_current_user_values(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    other_user = await register_user(async_client)
+
+    category = await async_client.post(
+        "/categories",
+        headers=user["headers"],
+        json={
+            "name": f"Activity Summary {uuid4().hex[:8]}",
+            "slug": f"activity-summary-{uuid4().hex[:8]}",
+        },
+    )
+    assert category.status_code == 201
+    category_id = category.json()["id"]
+
+    post_ids = []
+    for title in ["Completed One", "Completed Two", "Started Only"]:
+        created = await async_client.post(
+            "/posts",
+            headers=user["headers"],
+            json={
+                "title": title,
+                "content": "Current user activity content.",
+                "category_id": category_id,
+                "status": "published",
+            },
+        )
+        assert created.status_code == 201
+        post_ids.append(created.json()["id"])
+
+    draft = await async_client.post(
+        "/posts",
+        headers=user["headers"],
+        json={
+            "title": "Current Draft",
+            "content": "Draft activity content.",
+            "category_id": category_id,
+            "status": "draft",
+        },
+    )
+    assert draft.status_code == 201
+
+    other_post = await async_client.post(
+        "/posts",
+        headers=other_user["headers"],
+        json={
+            "title": "Other User Published",
+            "content": "Other user content.",
+            "category_id": category_id,
+            "status": "published",
+        },
+    )
+    assert other_post.status_code == 201
+    other_progress = await async_client.post(
+        f"/me/reading-records/{post_ids[0]}",
+        headers=other_user["headers"],
+        json={"progress_percent": 100, "reading_minutes": 99},
+    )
+    assert other_progress.status_code == 200
+
+    for post_id, progress_percent, reading_minutes in [
+        (post_ids[0], 100, 5),
+        (post_ids[1], 100, 7),
+        (post_ids[2], 40, 3),
+    ]:
+        progress = await async_client.post(
+            f"/me/reading-records/{post_id}",
+            headers=user["headers"],
+            json={
+                "progress_percent": progress_percent,
+                "reading_minutes": reading_minutes,
+            },
+        )
+        assert progress.status_code == 200
+
+    saved = await async_client.post(
+        f"/me/saved-posts/{post_ids[2]}", headers=user["headers"]
+    )
+    assert saved.status_code == 201
+
+    expected_keys = {
+        "articles_read",
+        "reading_minutes",
+        "writing_streak_days",
+        "published_posts",
+        "draft_posts",
+        "saved_posts",
+    }
+    first = await async_client.get("/me/activity-summary", headers=user["headers"])
+    second = await async_client.get("/me/activity-summary", headers=user["headers"])
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert set(first.json()) == expected_keys
+    assert first.json() == second.json()
+    assert first.json()["articles_read"] == 2
+    assert first.json()["reading_minutes"] == 15
+    assert first.json()["published_posts"] == 3
+    assert first.json()["draft_posts"] == 1
+    assert first.json()["saved_posts"] == 1
+
+
+@pytest.mark.anyio
+async def test_android_activity_summary_no_activity_stable_zero_shape(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+
+    response = await async_client.get("/me/activity-summary", headers=user["headers"])
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "articles_read": 0,
+        "reading_minutes": 0,
+        "writing_streak_days": 0,
+        "published_posts": 0,
+        "draft_posts": 0,
+        "saved_posts": 0,
+    }
+
+
+@pytest.mark.anyio
+async def test_android_activity_summary_rejects_expired_and_invalid_access_tokens(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+
+    expired = await async_client.get(
+        "/me/activity-summary",
+        headers={
+            "Authorization": (
+                f"Bearer {expired_access_token(user['user']['id'], user['user']['email'])}"
+            )
+        },
+    )
+    invalid = await async_client.get(
+        "/me/activity-summary",
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+
+    assert expired.status_code == 401
+    assert expired.json()["detail"] == "Authentication token expired"
+    assert invalid.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_android_home_profile_and_draft_endpoints_count_current_user_drafts(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    other_user = await register_user(async_client)
+
+    category = await async_client.post(
+        "/categories",
+        headers=user["headers"],
+        json={
+            "name": f"Draft Counts {uuid4().hex[:8]}",
+            "slug": f"draft-counts-{uuid4().hex[:8]}",
+        },
+    )
+    assert category.status_code == 201
+    category_id = category.json()["id"]
+    draft_tag = f"draft-count-{uuid4().hex[:8]}"
+
+    draft_ids = []
+    for title in ["First Draft", "Second Draft"]:
+        created = await async_client.post(
+            "/posts",
+            headers=user["headers"],
+            json={
+                "title": title,
+                "content": "Draft content.",
+                "category_id": category_id,
+                "status": "draft",
+                "tags": [draft_tag],
+            },
+        )
+        assert created.status_code == 201
+        draft_ids.append(created.json()["id"])
+
+    published = await async_client.post(
+        "/posts",
+        headers=user["headers"],
+        json={
+            "title": "Published Is Not Draft",
+            "content": "Published content.",
+            "category_id": category_id,
+            "status": "published",
+            "tags": [draft_tag],
+        },
+    )
+    assert published.status_code == 201
+
+    archived = await async_client.post(
+        "/posts",
+        headers=user["headers"],
+        json={
+            "title": "Archived Is Not Draft",
+            "content": "Archived content.",
+            "category_id": category_id,
+            "status": "archived",
+            "tags": [draft_tag],
+        },
+    )
+    assert archived.status_code == 201
+
+    other_draft = await async_client.post(
+        "/posts",
+        headers=other_user["headers"],
+        json={
+            "title": "Other User Draft",
+            "content": "Other draft content.",
+            "category_id": category_id,
+            "status": "draft",
+            "tags": [draft_tag],
+        },
+    )
+    assert other_draft.status_code == 201
+
+    profile = await async_client.get("/auth/me", headers=user["headers"])
+    assert profile.status_code == 200
+    assert profile.json()["posts_count"] == 4
+    assert profile.json()["published_posts_count"] == 1
+    assert profile.json()["draft_posts_count"] == 2
+    assert profile.json()["archived_posts_count"] == 1
+    assert profile.json()["published_posts"] == 1
+    assert profile.json()["draft_posts"] == 2
+    assert profile.json()["archived_posts"] == 1
+
+    activity = await async_client.get("/me/activity-summary", headers=user["headers"])
+    assert activity.status_code == 200
+    assert activity.json()["published_posts"] == 1
+    assert activity.json()["draft_posts"] == 2
+
+    own_drafts = await async_client.get("/posts?status=draft", headers=user["headers"])
+    assert own_drafts.status_code == 200
+    assert {post["id"] for post in own_drafts.json()} == set(draft_ids)
+
+    other_user_drafts = await async_client.get(
+        f"/posts?author_id={other_user['user']['id']}&status=draft",
+        headers=user["headers"],
+    )
+    assert other_user_drafts.status_code == 200
+    assert other_user_drafts.json() == []
+
+    hidden_other_draft = await async_client.get(
+        f"/posts/{other_draft.json()['id']}", headers=user["headers"]
+    )
+    assert hidden_other_draft.status_code == 404
+
+    draft_categories = await async_client.get(
+        "/categories?include_counts=true&status=draft", headers=user["headers"]
+    )
+    assert draft_categories.status_code == 200
+    counted_category = next(
+        item for item in draft_categories.json() if item["id"] == category_id
+    )
+    assert counted_category["posts_count"] == 5
+
+    draft_tags = await async_client.get(
+        "/tags?include_counts=true&status=draft", headers=user["headers"]
+    )
+    assert draft_tags.status_code == 200
+    counted_tag = next(item for item in draft_tags.json() if item["name"] == draft_tag)
+    assert counted_tag["posts_count"] == 2
+
+
+@pytest.mark.anyio
+async def test_android_categories_return_all_status_post_counts(
+    async_client: AsyncClient,
+):
+    user = await register_user(async_client)
+    headers = user["headers"]
+
+    drafts_category = await async_client.post(
+        "/categories",
+        headers=headers,
+        json={
+            "name": f"Draft Category {uuid4().hex[:8]}",
+            "slug": f"draft-category-{uuid4().hex[:8]}",
+        },
+    )
+    mixed_category = await async_client.post(
+        "/categories",
+        headers=headers,
+        json={
+            "name": f"Mixed Category {uuid4().hex[:8]}",
+            "slug": f"mixed-category-{uuid4().hex[:8]}",
+        },
+    )
+    empty_category = await async_client.post(
+        "/categories",
+        headers=headers,
+        json={
+            "name": f"Empty Category {uuid4().hex[:8]}",
+            "slug": f"empty-category-{uuid4().hex[:8]}",
+        },
+    )
+    assert drafts_category.status_code == 201
+    assert mixed_category.status_code == 201
+    assert empty_category.status_code == 201
+
+    for index in range(2):
+        created = await async_client.post(
+            "/posts",
+            headers=headers,
+            json={
+                "title": f"Draft Count {index}",
+                "content": "Draft category content.",
+                "category_id": drafts_category.json()["id"],
+                "status": "draft",
+            },
+        )
+        assert created.status_code == 201
+
+    for status_value in ["published", "draft", "archived"]:
+        created = await async_client.post(
+            "/posts",
+            headers=headers,
+            json={
+                "title": f"Mixed Count {status_value}",
+                "content": "Mixed category content.",
+                "category_id": mixed_category.json()["id"],
+                "status": status_value,
+            },
+        )
+        assert created.status_code == 201
+
+    legacy_post = await async_client.post(
+        "/post", headers=headers, json={"body": "Legacy uncategorized draft"}
+    )
+    assert legacy_post.status_code == 201
+
+    response = await async_client.get("/categories", headers=headers)
+    assert response.status_code == 200
+    categories = response.json()
+    assert all(isinstance(item["posts_count"], int) for item in categories)
+
+    draft_item = next(
+        item for item in categories if item["id"] == drafts_category.json()["id"]
+    )
+    mixed_item = next(
+        item for item in categories if item["id"] == mixed_category.json()["id"]
+    )
+    empty_item = next(
+        item for item in categories if item["id"] == empty_category.json()["id"]
+    )
+    assert draft_item["posts_count"] == 2
+    assert mixed_item["posts_count"] == 3
+    assert empty_item["posts_count"] == 0
+
+    uncategorized = await database.fetch_one(
+        category_table.select().where(category_table.c.slug == "uncategorized")
+    )
+    assert uncategorized is not None
+    uncategorized_count = await database.fetch_val(
+        select(func.count())
+        .select_from(post_table)
+        .where(post_table.c.category_id == uncategorized["id"])
+    )
+    uncategorized_item = next(
+        item for item in categories if item["id"] == uncategorized["id"]
+    )
+    assert uncategorized_item["posts_count"] == uncategorized_count
 
 
 @pytest.mark.anyio
@@ -672,7 +1062,9 @@ async def test_android_reading_journey_months_sort_newest_first(
     relevant_months = [
         (item["year"], item["month"])
         for item in response.json()["months"]
-        if any(category["category_id"] == category_id for category in item["categories"])
+        if any(
+            category["category_id"] == category_id for category in item["categories"]
+        )
     ]
     assert relevant_months == [(2026, 4), (2026, 3)]
 

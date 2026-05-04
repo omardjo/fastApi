@@ -1,7 +1,9 @@
 import asyncio
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
+import logging
 import secrets
+from time import perf_counter
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -12,7 +14,6 @@ from blogapi.database import (
     auth_security_event_table,
     comment_table,
     database,
-    post_table,
     refresh_token_table,
     saved_post_table,
     user_follow_table,
@@ -36,8 +37,10 @@ from blogapi.security import (
     hash_refresh_token,
     verify_password,
 )
+from blogapi.services.post_counts import get_user_post_counts
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 _auth_schema_ready = False
 CurrentUser = Annotated[dict, Depends(get_current_user)]
 _rate_limiter_lock = asyncio.Lock()
@@ -220,6 +223,7 @@ async def _auth_response(user_id: int, access_token: str, refresh_token: str):
 
 
 async def _current_user_profile(user_id: int) -> dict:
+    endpoint_started_at = perf_counter()
     user = await database.fetch_one(
         user_table.select().where(user_table.c.id == user_id)
     )
@@ -228,10 +232,19 @@ async def _current_user_profile(user_id: int) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found"
         )
 
-    posts_count = await database.fetch_val(
-        sqlalchemy.select(sqlalchemy.func.count())
-        .select_from(post_table)
-        .where(post_table.c.author_id == user_id)
+    post_counts_started_at = perf_counter()
+    post_counts = await get_user_post_counts(user_id)
+    logger.info(
+        "current_user_profile.post_counts_finished",
+        extra={
+            "endpoint": "/auth/me",
+            "user_id": user_id,
+            "target_user_id": user_id,
+            "duration_ms": round((perf_counter() - post_counts_started_at) * 1000, 2),
+            "published_count": post_counts["published_posts_count"],
+            "draft_count": post_counts["draft_posts_count"],
+            "archived_count": post_counts["archived_posts_count"],
+        },
     )
     comments_count = await database.fetch_val(
         sqlalchemy.select(sqlalchemy.func.count())
@@ -256,12 +269,32 @@ async def _current_user_profile(user_id: int) -> dict:
     data = dict(user)
     data.update(
         {
-            "posts_count": posts_count or 0,
+            **post_counts,
+            "published_posts": post_counts["published_posts_count"],
+            "draft_posts": post_counts["draft_posts_count"],
+            "archived_posts": post_counts["archived_posts_count"],
             "comments_count": comments_count or 0,
             "saved_posts_count": saved_posts_count or 0,
             "followers_count": followers_count or 0,
             "following_count": following_count or 0,
         }
+    )
+    logger.info(
+        "current_user_profile.completed",
+        extra={
+            "endpoint": "/auth/me",
+            "user_id": user_id,
+            "target_user_id": user_id,
+            "duration_ms": round((perf_counter() - endpoint_started_at) * 1000, 2),
+            "metrics": {
+                "posts_count": data["posts_count"],
+                "published_posts_count": data["published_posts_count"],
+                "draft_posts_count": data["draft_posts_count"],
+                "archived_posts_count": data["archived_posts_count"],
+                "comments_count": data["comments_count"],
+                "saved_posts_count": data["saved_posts_count"],
+            },
+        },
     )
     return data
 

@@ -1,6 +1,8 @@
 import calendar
 from collections import defaultdict
 from datetime import UTC, date, datetime
+import logging
+from time import perf_counter
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -25,12 +27,44 @@ from blogapi.models.me import (
     UserSettingsOut,
     UserSettingsUpdate,
 )
+from blogapi.models.post import PUBLISHED_STATUS
 from blogapi.models.users import DeviceTokenIn, DeviceTokenOut
 from blogapi.routers.post import find_post, _post_summary, _reading_minutes
 from blogapi.security import get_current_user
+from blogapi.services.post_counts import get_user_post_counts
 
 router = APIRouter(prefix="/me", tags=["me"])
 CurrentUser = Annotated[dict, Depends(get_current_user)]
+logger = logging.getLogger(__name__)
+
+
+async def _timed_activity_metric(name: str, user_id: int, query):
+    started_at = perf_counter()
+    try:
+        value = await database.fetch_val(query)
+    except Exception:
+        logger.exception(
+            "activity_summary.metric_failed",
+            extra={
+                "endpoint": "/me/activity-summary",
+                "user_id": user_id,
+                "metric": name,
+                "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            },
+        )
+        raise
+
+    logger.info(
+        "activity_summary.metric_finished",
+        extra={
+            "endpoint": "/me/activity-summary",
+            "user_id": user_id,
+            "metric": name,
+            "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "value": value,
+        },
+    )
+    return value
 
 
 async def _saved_post_out(user_id: int, post_id: int) -> dict:
@@ -181,7 +215,7 @@ async def reading_journey(current_user: CurrentUser):
     for category in categories:
         posts_filter = post_table.c.category_id == category["id"]
         published_filter = posts_filter & (
-            func.lower(post_table.c.status) == "published"
+            func.lower(post_table.c.status) == PUBLISHED_STATUS
         )
         total_posts = await database.fetch_val(
             select(func.count()).select_from(post_table).where(published_filter)
@@ -315,7 +349,7 @@ async def _reading_journey_months(user_id: int, category_totals: dict[int, int])
         )
         .select_from(progress_join)
         .where(reading_record_table.c.user_id == user_id)
-        .where(func.lower(post_table.c.status) == "published")
+        .where(func.lower(post_table.c.status) == PUBLISHED_STATUS)
         .where(reading_record_table.c.progress_percent > 0)
     )
 
@@ -332,7 +366,7 @@ async def _reading_journey_months(user_id: int, category_totals: dict[int, int])
         )
         .select_from(saved_join)
         .where(saved_post_table.c.user_id == user_id)
-        .where(func.lower(post_table.c.status) == "published")
+        .where(func.lower(post_table.c.status) == PUBLISHED_STATUS)
     )
 
     months = defaultdict(_empty_month_bucket)
@@ -438,7 +472,7 @@ def _writing_streak_days(rows) -> int:
     published_dates = {
         row["created_at"].date()
         for row in rows
-        if row["created_at"] is not None and row["status"] == "published"
+        if row["created_at"] is not None and row["status"] == PUBLISHED_STATUS
     }
     if not published_dates:
         return 0
@@ -454,47 +488,102 @@ def _writing_streak_days(rows) -> int:
 @router.get("/activity-summary", response_model=ActivitySummaryOut)
 async def activity_summary(current_user: CurrentUser):
     user_id = current_user["id"]
-    articles_read = await database.fetch_val(
-        select(func.count())
-        .select_from(reading_record_table)
-        .where(
-            (reading_record_table.c.user_id == user_id)
-            & (reading_record_table.c.progress_percent >= 100)
+    endpoint_started_at = perf_counter()
+    logger.info(
+        "activity_summary.called",
+        extra={"endpoint": "/me/activity-summary", "user_id": user_id},
+    )
+    try:
+        articles_read = await _timed_activity_metric(
+            "articles_read",
+            user_id,
+            select(func.count())
+            .select_from(reading_record_table)
+            .where(
+                (reading_record_table.c.user_id == user_id)
+                & (reading_record_table.c.progress_percent >= 100)
+            ),
         )
-    )
-    reading_minutes = await database.fetch_val(
-        select(func.coalesce(func.sum(reading_record_table.c.reading_minutes), 0))
-        .select_from(reading_record_table)
-        .where(reading_record_table.c.user_id == user_id)
-    )
-    published_posts = await database.fetch_val(
-        select(func.count())
-        .select_from(post_table)
-        .where(
-            (post_table.c.author_id == user_id) & (post_table.c.status == "published")
+        reading_minutes = await _timed_activity_metric(
+            "reading_minutes",
+            user_id,
+            select(func.coalesce(func.sum(reading_record_table.c.reading_minutes), 0))
+            .select_from(reading_record_table)
+            .where(reading_record_table.c.user_id == user_id),
         )
-    )
-    draft_posts = await database.fetch_val(
-        select(func.count())
-        .select_from(post_table)
-        .where((post_table.c.author_id == user_id) & (post_table.c.status == "draft"))
-    )
-    saved_posts = await database.fetch_val(
-        select(func.count())
-        .select_from(saved_post_table)
-        .where(saved_post_table.c.user_id == user_id)
-    )
-    authored_posts = await database.fetch_all(
-        post_table.select().where(post_table.c.author_id == user_id)
-    )
-    return {
-        "articles_read": articles_read or 0,
-        "reading_minutes": reading_minutes or 0,
-        "writing_streak_days": _writing_streak_days(authored_posts),
-        "published_posts": published_posts or 0,
-        "draft_posts": draft_posts or 0,
-        "saved_posts": saved_posts or 0,
-    }
+        post_counts_started_at = perf_counter()
+        post_counts = await get_user_post_counts(user_id)
+        logger.info(
+            "activity_summary.post_counts_finished",
+            extra={
+                "endpoint": "/me/activity-summary",
+                "user_id": user_id,
+                "target_user_id": user_id,
+                "duration_ms": round(
+                    (perf_counter() - post_counts_started_at) * 1000, 2
+                ),
+                "published_count": post_counts["published_posts_count"],
+                "draft_count": post_counts["draft_posts_count"],
+                "archived_count": post_counts["archived_posts_count"],
+            },
+        )
+        saved_posts = await _timed_activity_metric(
+            "saved_posts",
+            user_id,
+            select(func.count())
+            .select_from(saved_post_table)
+            .where(saved_post_table.c.user_id == user_id),
+        )
+
+        authored_query_started_at = perf_counter()
+        authored_posts = await database.fetch_all(
+            select(post_table.c.created_at, post_table.c.status).where(
+                post_table.c.author_id == user_id
+            )
+        )
+        logger.info(
+            "activity_summary.query_finished",
+            extra={
+                "endpoint": "/me/activity-summary",
+                "user_id": user_id,
+                "query": "authored_posts_for_writing_streak",
+                "duration_ms": round(
+                    (perf_counter() - authored_query_started_at) * 1000, 2
+                ),
+                "row_count": len(authored_posts),
+            },
+        )
+
+        response = {
+            "articles_read": articles_read or 0,
+            "reading_minutes": reading_minutes or 0,
+            "writing_streak_days": _writing_streak_days(authored_posts),
+            "published_posts": post_counts["published_posts_count"],
+            "draft_posts": post_counts["draft_posts_count"],
+            "saved_posts": saved_posts or 0,
+        }
+        logger.info(
+            "activity_summary.completed",
+            extra={
+                "endpoint": "/me/activity-summary",
+                "user_id": user_id,
+                "status_code": 200,
+                "duration_ms": round((perf_counter() - endpoint_started_at) * 1000, 2),
+                "values": response,
+            },
+        )
+        return response
+    except Exception:
+        logger.exception(
+            "activity_summary.failed",
+            extra={
+                "endpoint": "/me/activity-summary",
+                "user_id": user_id,
+                "status_code": 500,
+                "duration_ms": round((perf_counter() - endpoint_started_at) * 1000, 2),
+            },
+        )
+        raise
 
 
 async def _settings_for_user(user_id: int) -> dict:

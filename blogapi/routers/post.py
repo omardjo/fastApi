@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+import logging
+from time import perf_counter
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
@@ -16,16 +18,19 @@ from blogapi.database import (
 )
 from blogapi.models.me import ReadingRecordIn, ReadingRecordOut
 from blogapi.models.post import (
+    ARCHIVED_STATUS,
     CategoryCreate,
     CategoryOut,
     Comment,
     CommentIn,
+    DRAFT_STATUS,
     PostCommentCreate,
     PostCommentOut,
     PostCreate,
     PostDetailOut,
     PostSummaryOut,
     PostUpdate,
+    PUBLISHED_STATUS,
     TagCreate,
     TagOut,
     UserPost,
@@ -36,6 +41,10 @@ from blogapi.security import get_current_user
 from blogapi.services.firebase_notifications import notify_followers_about_new_post
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
+logger = logging.getLogger(__name__)
+
+
+PRIVATE_POST_STATUSES = {DRAFT_STATUS, ARCHIVED_STATUS}
 
 
 async def find_post(post_id: int):
@@ -161,7 +170,7 @@ async def _post_summary(post_row) -> dict:
         "id": post_data["id"],
         "title": post_data.get("title") or post_data.get("body") or "",
         "slug": post_data.get("slug") or _slugify(post_data.get("title") or "post"),
-        "status": post_data.get("status") or "draft",
+        "status": post_data.get("status") or DRAFT_STATUS,
         "created_at": post_data.get("created_at") or datetime.now(UTC),
         "updated_at": post_data.get("updated_at")
         or post_data.get("created_at")
@@ -225,7 +234,7 @@ async def create_post(
         "title": post.body[:255],
         "content": post.body,
         "slug": slug,
-        "status": "draft",
+        "status": DRAFT_STATUS,
         "author_id": current_user["id"],
         "category_id": await _default_category_id(),
         "created_at": datetime.now(UTC),
@@ -306,27 +315,60 @@ async def create_category(payload: CategoryCreate):
 
 @router.get("/categories", response_model=list[CategoryOut])
 async def list_categories(
+    current_user=Depends(get_current_user),
     include_counts: bool = Query(default=False),
-    status_value: str | None = Query(default="published", alias="status"),
+    status_value: str | None = Query(default=PUBLISHED_STATUS, alias="status"),
 ):
-    categories = await database.fetch_all(
-        category_table.select().order_by(category_table.c.name.asc())
+    started_at = perf_counter()
+    logger.info(
+        "categories.called",
+        extra={
+            "endpoint": "/categories",
+            "user_id": current_user["id"],
+            "include_counts": include_counts,
+            "status": status_value,
+        },
     )
-    result = []
-    for category in categories:
-        item = dict(category)
-        if include_counts:
-            count_query = (
-                select(func.count())
-                .select_from(post_table)
-                .where(post_table.c.category_id == category["id"])
+    post_counts = (
+        select(
+            post_table.c.category_id,
+            func.count(post_table.c.id).label("posts_count"),
+        )
+        .group_by(post_table.c.category_id)
+        .subquery()
+    )
+    rows = await database.fetch_all(
+        select(
+            category_table.c.id,
+            category_table.c.name,
+            category_table.c.slug,
+            func.coalesce(post_counts.c.posts_count, 0).label("posts_count"),
+        )
+        .select_from(
+            category_table.outerjoin(
+                post_counts, category_table.c.id == post_counts.c.category_id
             )
-            if status_value:
-                count_query = count_query.where(
-                    func.lower(post_table.c.status) == status_value.lower()
-                )
-            item["posts_count"] = await database.fetch_val(count_query) or 0
-        result.append(item)
+        )
+        .order_by(category_table.c.name.asc())
+    )
+    result = [dict(row) for row in rows]
+    logger.info(
+        "categories.completed",
+        extra={
+            "endpoint": "/categories",
+            "user_id": current_user["id"],
+            "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "categories_count": len(result),
+            "categories": [
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "posts_count": item["posts_count"],
+                }
+                for item in result
+            ],
+        },
+    )
     return result
 
 
@@ -342,14 +384,16 @@ async def create_tag(payload: TagCreate):
 
 @router.get("/tags", response_model=list[TagOut])
 async def list_tags(
+    current_user=Depends(get_current_user),
     include_counts: bool = Query(default=False),
-    status_value: str | None = Query(default="published", alias="status"),
+    status_value: str | None = Query(default=PUBLISHED_STATUS, alias="status"),
 ):
     tags = await database.fetch_all(tag_table.select().order_by(tag_table.c.name.asc()))
     result = []
     for tag_row in tags:
         item = dict(tag_row)
         if include_counts:
+            count_started_at = perf_counter()
             count_query = (
                 select(func.count())
                 .select_from(
@@ -360,10 +404,30 @@ async def list_tags(
                 .where(post_tag_table.c.tag_id == tag_row["id"])
             )
             if status_value:
+                normalized_status = status_value.lower()
                 count_query = count_query.where(
-                    func.lower(post_table.c.status) == status_value.lower()
+                    func.lower(post_table.c.status) == normalized_status
                 )
+                if normalized_status in PRIVATE_POST_STATUSES:
+                    count_query = count_query.where(
+                        post_table.c.author_id == current_user["id"]
+                    )
             item["posts_count"] = await database.fetch_val(count_query) or 0
+            if status_value and status_value.lower() == DRAFT_STATUS:
+                logger.info(
+                    "tag_counts.draft_count_returned",
+                    extra={
+                        "endpoint": "/tags",
+                        "user_id": current_user["id"],
+                        "target_user_id": current_user["id"],
+                        "tag_id": tag_row["id"],
+                        "draft_count": item["posts_count"],
+                        "duration_ms": round(
+                            (perf_counter() - count_started_at) * 1000, 2
+                        ),
+                        "metrics": {"posts_count": item["posts_count"]},
+                    },
+                )
         result.append(item)
     return result
 
@@ -400,7 +464,7 @@ async def create_post_v2(payload: PostCreate, current_user=Depends(get_current_u
     await _replace_post_tags(post_id, tag_ids)
 
     created = await find_post(post_id)
-    if payload.status == "published":
+    if payload.status == PUBLISHED_STATUS:
         await notify_followers_about_new_post(
             author_id=current_user["id"], post_id=post_id, post_title=payload.title
         )
@@ -409,6 +473,7 @@ async def create_post_v2(payload: PostCreate, current_user=Depends(get_current_u
 
 @router.get("/posts", response_model=list[PostSummaryOut])
 async def list_posts(
+    current_user=Depends(get_current_user),
     category_slug: str | None = Query(default=None),
     tag: str | None = Query(default=None),
     author_id: int | None = Query(default=None),
@@ -416,6 +481,7 @@ async def list_posts(
     status_value: str | None = Query(default=None, alias="status"),
 ):
     query = select(post_table)
+    target_author_id = author_id
     if category_slug:
         query = query.join(
             category_table, post_table.c.category_id == category_table.c.id
@@ -438,9 +504,20 @@ async def list_posts(
         )
         if author_row is None:
             return []
-        filters.append(post_table.c.author_id == author_row["id"])
+        target_author_id = author_row["id"]
+        filters.append(post_table.c.author_id == target_author_id)
     if status_value is not None:
-        filters.append(func.lower(post_table.c.status) == status_value.lower())
+        normalized_status = status_value.lower()
+        filters.append(func.lower(post_table.c.status) == normalized_status)
+        if normalized_status in PRIVATE_POST_STATUSES:
+            if target_author_id is not None and target_author_id != current_user["id"]:
+                return []
+            filters.append(post_table.c.author_id == current_user["id"])
+    else:
+        filters.append(
+            (func.lower(post_table.c.status) == PUBLISHED_STATUS)
+            | (post_table.c.author_id == current_user["id"])
+        )
     if filters:
         query = query.where(and_(*filters))
 
@@ -458,9 +535,14 @@ async def list_posts(
 
 
 @router.get("/posts/{post_id}", response_model=PostDetailOut)
-async def get_post(post_id: int):
+async def get_post(post_id: int, current_user=Depends(get_current_user)):
     post = await find_post(post_id)
     if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if (
+        str(post["status"]).lower() in PRIVATE_POST_STATUSES
+        and post["author_id"] != current_user["id"]
+    ):
         raise HTTPException(status_code=404, detail="Post not found")
     return await _post_detail(post)
 

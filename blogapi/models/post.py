@@ -27,6 +27,9 @@ TagNameStr = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
 ]
+DRAFT_STATUS = "draft"
+PUBLISHED_STATUS = "published"
+ARCHIVED_STATUS = "archived"
 PostStatus = Literal["draft", "published", "archived"]
 
 
@@ -77,7 +80,7 @@ class CategoryCreate(BaseModel):
 
 class CategoryOut(CategoryCreate):
     id: int
-    posts_count: int | None = None
+    posts_count: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
